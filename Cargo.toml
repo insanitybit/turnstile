@@ -1,0 +1,30 @@
+[package]
+name = "turnstilers"
+version = "0.1.0"
+authors = ["Colin O'Brien <cobrien@rapid7.com>"]
+
+[dependencies]
+base64 = "0.4.*"
+clap = "2.23.*"
+error-chain = "0.10.*"
+futures = "0.1.*"
+ring = "0.7.*"
+serde_json = "0.9.*"
+serde = "0.9.*"
+serde_derive = "0.9.*"
+slog = {version = "1.*.*", features = ["max_level_trace"]}
+slog-json = "1.2.*"
+slog-stream = "1.2.*    "
+tokio-core = "0.1.*"
+time = "0.1.*"
+uuid = { version = "0.4.*", features = ["v4"] }
+xorshift = "0.1.*"
+
+[dependencies.dogstatsd]
+git = "https://github.com/insanitybit/dogstatsd-rs"
+
+[dependencies.hyper]
+git = "https://github.com/hyperium/hyper"
+
+[features]
+unstable = []
