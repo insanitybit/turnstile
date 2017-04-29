@@ -449,7 +449,7 @@ impl Service for Turnstile {
 
         match request {
             Ok(request) => {
-                Box::new(futures::future::ok(Box::new(self.client.request(request).then(|res| match res {
+                Box::new(self.client.request(request).then(|res| match res {
                     Ok(res) => {
                         Box::new(futures::future::ok(
                             Response::new()
@@ -468,7 +468,7 @@ impl Service for Turnstile {
                                 .with_body(err)
                         ))
                     }
-                }))))
+                }))
             }
             Err(e) => {
                 let body = json!({
@@ -486,104 +486,6 @@ impl Service for Turnstile {
             }
 
         }
-//        unimplemented!()
-
-//        Box::new(validate_headers(metrics, self.logger.clone(), client_method, client_uri, client_headers, client_body).then(|res| {
-//            match res {
-//                Err(e @ AuthorizationResult::InvalidHeader(_)) => {
-//                    let body = body_from_auth_error(e);
-//                    return Box::new(futures::future::err(
-//                        Response::new()
-//                            .with_status(StatusCode::BadRequest)
-//                            .with_header(ContentType("application/json".parse().unwrap()))
-//                            .with_header(ContentLength(body.len() as u64))
-//                            .with_body(body)
-//                    ))
-//                }
-//                Err(e @ AuthorizationResult::UnAuthurized) => {
-//                    let body = body_from_auth_error(e);
-//                    return Box::new(futures::future::err(
-//                        Response::new()
-//                            .with_status(StatusCode::Unauthorized)
-//                            .with_header(ContentType("application/json".parse().unwrap()))
-//                            .with_header(ContentLength(body.len() as u64))
-//                            .with_body(body)
-//                    ))
-//                }
-//                Err(e @ AuthorizationResult::SkewError) => {
-//                    let body = body_from_auth_error(e);
-//                    return Box::new(futures::future::err(
-//                        Response::new()
-//                            .with_status(StatusCode::Unauthorized)
-//                            .with_header(ContentType("application/json".parse().unwrap()))
-//                            .with_header(ContentLength(body.len() as u64))
-//                            .with_body(body)
-//                    ))
-//                }
-//                Err(e @ AuthorizationResult::MissingHeaders(_)) => {
-//                    let body = body_from_auth_error(e);
-//                    return Box::new(futures::future::err(
-//                        Response::new()
-//                            .with_status(StatusCode::BadRequest)
-//                            .with_header(ContentType("application/json".parse().unwrap()))
-//                            .with_header(ContentLength(body.len() as u64))
-//                            .with_body(body)
-//                    ))
-//                }
-//                Ok(body) => Box::new(futures::future::ok(body))
-//            }
-//        }).then(|res| {
-//            match res {
-//                Ok(body) => {
-//                    let request = self.gen_request(client_method, client_uri, client_version, client_headers, body);
-//
-//                    match request {
-//                        Ok(request) => {
-//                            Box::new(futures::future::ok(Box::new(self.client.request(request).then(|res| match res {
-//                                Ok(res) => {
-//                                    futures::future::ok(
-//                                        Response::new()
-//                                            .with_status(res.status())
-//                                            .with_headers(res.headers().clone())
-//                                            .with_body(res.body())
-//                                    )
-//                                }
-//                                Err(ref e) => {
-//                                    let (code, err) = client_err(e);
-//                                    futures::future::ok(
-//                                        Response::new()
-//                                            .with_status(code)
-//                                            .with_header(ContentType("application/json".parse().unwrap()))
-//                                            .with_header(ContentLength(err.len() as u64))
-//                                            .with_body(err)
-//                                    )
-//                                }
-//                            }))))
-//                        }
-//                        Err(e) => {
-//                            let body = json!({
-//                                "Message": "Could not generate downstream server request",
-//                                "Name": format!("{}", StatusCode::InternalServerError)
-//                                }).to_string();
-//
-//                            Box::new(futures::future::err(
-//                                Response::new()
-//                                    .with_status(StatusCode::InternalServerError)
-//                                    .with_header(ContentType("application/json".parse().unwrap()))
-//                                    .with_header(ContentLength(body.len() as u64))
-//                                    .with_body(body)
-//                            ))
-//                        }
-//
-//                    }
-//                },
-//                Err(e) => {
-//                    Box::new(futures::future::err(e))
-//                }
-//            }
-//        }).map_err(|res| {
-//            Box::new(futures::future::ok(res))
-//        }))
     }
 }
 
