@@ -89,29 +89,33 @@ fn bytes_to_algorithm(algorithm: &[u8]) -> std::result::Result<&'static ring::di
     }
 }
 
-fn validate_body(algorithm: &[u8], digest: Vec<u8>, body: Body) -> Box<Future<Item=Vec<u8>, Error=AuthorizationResult<'static>>> {
+fn validate_body(algorithm: &[u8], digest: Vec<u8>, body: Body) -> std::result::Result<Vec<u8>, AuthorizationResult<'static>> {
     let algorithm = match bytes_to_algorithm(algorithm) {
         Ok(a) => a,
-        Err(e) => return Box::new(futures::future::err(e))
+        Err(e) => return Err(e)
     };
 
-    // TODO: DDOS PROTECT THIS
+    let mut ctx = digest::Context::new(algorithm);
 
-    Box::new(body.fold(
-        (digest::Context::new(algorithm), Vec::new()), |(mut ctx, mut v), chunk| {
-            ctx.update(chunk.as_ref());
-            v.extend_from_slice(chunk.as_ref());
-            Ok::<_, hyper::Error>((ctx, v))
-        })
-        .map_err(|e| AuthorizationResult::BodyReadFailure(e))
-        .and_then(move |(ctx, body_bytes)| {
-            let body_digest = ctx.finish();
-            match ring::constant_time::verify_slices_are_equal(&digest[..], body_digest.as_ref()) {
-                Ok(_) => Ok(body_bytes),
-                Err(_) => Err(AuthorizationResult::UnAuthurized)
-            }
-        })
-    )
+    let res_body: Vec<_> = body.wait().collect();
+
+    let mut body = Vec::new();
+
+    for chunk in res_body {
+        match chunk {
+            Ok(bytes) => {
+                body.extend_from_slice(bytes.as_ref());
+                ctx.update(bytes.as_ref());
+            },
+            Err(e) => return Err(AuthorizationResult::BodyReadFailure(e))
+        }
+    }
+
+    let body_digest = ctx.finish();
+    match ring::constant_time::verify_slices_are_equal(&digest[..], body_digest.as_ref()) {
+        Ok(_) => Ok(body),
+        Err(_) => Err(AuthorizationResult::UnAuthurized)
+    }
 }
 
 fn check_skew(skew: i64, date: &time::Tm) -> Result<()> {
@@ -125,37 +129,39 @@ fn check_skew(skew: i64, date: &time::Tm) -> Result<()> {
     Ok(())
 }
 
-fn async_validate_headers(metric_dog: Dog, logger: slog::Logger, method: Method, uri: Uri, headers: Headers, body: Body) -> Box<Future<Item=Vec<u8>, Error=AuthorizationResult<'static>>> {
+fn validate_headers(metric_dog: Dog, logger: slog::Logger, method: &Method, uri: &Uri, headers: &Headers, body: Body) -> std::result::Result<Vec<u8>, AuthorizationResult<'static>> {
     let mut metric_dog = metric_dog;
     {
-        let missing = check_for_all_headers(&headers);
+        let missing = check_for_all_headers(headers);
         if !missing.is_empty() {
-            return Box::new(futures::future::err(AuthorizationResult::MissingHeaders(missing)))
+            return Err(AuthorizationResult::MissingHeaders(missing))
         }
     }
     // We know that the Date header must be present due to the previous check for all headers
     {
         let &Date(HttpDate(ref time)) = headers.get::<hyper::header::Date>().unwrap();
         if check_skew(10 * 60, time).is_err() {
-            return Box::new(futures::future::err(AuthorizationResult::SkewError))
+            return Err(AuthorizationResult::SkewError)
         }
     }
 
     let (algorithm, digest) = match headers.get_raw("digest").map(get_digest).unwrap() {
         Ok((a, d)) => (a, d),
-        Err(_) => return Box::new(futures::future::err(AuthorizationResult::InvalidHeader("Digest".into())))
+        Err(_) => return Err(AuthorizationResult::InvalidHeader("Digest".into()))
     };
 
-    Box::new(validate_body(&algorithm[..], digest, body).then(move |body| {
+    let body = validate_body(&algorithm[..], digest, body);
+
+
         let body = match body {
             Ok(body) => body,
-            Err(e) => return Box::new(futures::future::err(e))
+            Err(e) => return Err(e)
         };
 
         if let Some(&Authorization(Rapid7HmacScheme { hash: ref token })) = headers.get::<Authorization<Rapid7HmacScheme>>() {
             let (key_id, signature) = match auth_parse(token) {
                 Ok(pair) => pair,
-                Err(_) => return Box::new(futures::future::err(AuthorizationResult::InvalidHeader("Authorization".into())))
+                Err(_) => return Err(AuthorizationResult::InvalidHeader("Authorization".into()))
             };
 
             let mut data = Vec::new();
@@ -200,14 +206,13 @@ fn async_validate_headers(metric_dog: Dog, logger: slog::Logger, method: Method,
 
             if hmac::verify(&key, &data, &signature).is_ok() {
                 metric_dog.incr("validated", &[]);
-                Box::new(futures::future::ok(body))
+                Ok(body)
             } else {
-                Box::new(futures::future::err(AuthorizationResult::UnAuthurized))
+                Err(AuthorizationResult::UnAuthurized)
             }
         } else {
-            Box::new(futures::future::err(AuthorizationResult::UnsupportedAuthorizationScheme))
+            Err(AuthorizationResult::UnsupportedAuthorizationScheme)
         }
-    }))
 }
 
 impl Turnstile {
@@ -424,102 +429,161 @@ impl Service for Turnstile {
 
         let mut metrics = Dog::with_chance(20);
 
-        Box::new(async_validate_headers(metrics, self.logger.clone(), client_method, client_uri, client_headers, client_body).then(|res| {
-            match res {
-                Err(e @ AuthorizationResult::InvalidHeader(_)) => {
-                    let body = body_from_auth_error(e);
-                    return Box::new(futures::future::err(
-                        Response::new()
-                            .with_status(StatusCode::BadRequest)
-                            .with_header(ContentType("application/json".parse().unwrap()))
-                            .with_header(ContentLength(body.len() as u64))
-                            .with_body(body)
-                    ))
-                }
-                Err(e @ AuthorizationResult::UnAuthurized) => {
-                    let body = body_from_auth_error(e);
-                    return Box::new(futures::future::err(
-                        Response::new()
-                            .with_status(StatusCode::Unauthorized)
-                            .with_header(ContentType("application/json".parse().unwrap()))
-                            .with_header(ContentLength(body.len() as u64))
-                            .with_body(body)
-                    ))
-                }
-                Err(e @ AuthorizationResult::SkewError) => {
-                    let body = body_from_auth_error(e);
-                    return Box::new(futures::future::err(
-                        Response::new()
-                            .with_status(StatusCode::Unauthorized)
-                            .with_header(ContentType("application/json".parse().unwrap()))
-                            .with_header(ContentLength(body.len() as u64))
-                            .with_body(body)
-                    ))
-                }
-                Err(e @ AuthorizationResult::MissingHeaders(_)) => {
-                    let body = body_from_auth_error(e);
-                    return Box::new(futures::future::err(
-                        Response::new()
-                            .with_status(StatusCode::BadRequest)
-                            .with_header(ContentType("application/json".parse().unwrap()))
-                            .with_header(ContentLength(body.len() as u64))
-                            .with_body(body)
-                    ))
-                }
-                Ok(body) => Box::new(futures::future::ok(body))
-            }
-        }).then(|res| {
-            match res {
-                Ok(body) => {
-                    let request = self.gen_request(client_method, client_uri, client_version, client_headers, body);
+        let res = validate_headers(metrics, self.logger.clone(), &client_method, &client_uri, &client_headers, client_body);
 
-                    match request {
-                        Ok(request) => {
-                            Box::new(futures::future::ok(Box::new(self.client.request(request).then(|res| match res {
-                                Ok(res) => {
-                                    futures::future::ok(
-                                        Response::new()
-                                            .with_status(res.status())
-                                            .with_headers(res.headers().clone())
-                                            .with_body(res.body())
-                                    )
-                                }
-                                Err(ref e) => {
-                                    let (code, err) = client_err(e);
-                                    futures::future::ok(
-                                        Response::new()
-                                            .with_status(code)
-                                            .with_header(ContentType("application/json".parse().unwrap()))
-                                            .with_header(ContentLength(err.len() as u64))
-                                            .with_body(err)
-                                    )
-                                }
-                            }))))
-                        }
-                        Err(e) => {
-                            let body = json!({
+        let body = match res {
+            Err(e) => {
+                let body = body_from_auth_error(e);
+                return Box::new(futures::future::ok(
+                    Response::new()
+                        .with_status(StatusCode::BadRequest)
+                        .with_header(ContentType("application/json".parse().unwrap()))
+                        .with_header(ContentLength(body.len() as u64))
+                        .with_body(body)
+                ))
+            }
+            Ok(body) => body
+        };
+
+        let request = self.gen_request(client_method, client_uri, client_version, client_headers, body);
+
+        match request {
+            Ok(request) => {
+                Box::new(futures::future::ok(Box::new(self.client.request(request).then(|res| match res {
+                    Ok(res) => {
+                        Box::new(futures::future::ok(
+                            Response::new()
+                                .with_status(res.status())
+                                .with_headers(res.headers().clone())
+                                .with_body(res.body())
+                        ))
+                    }
+                    Err(ref e) => {
+                        let (code, err) = client_err(e);
+                        Box::new(futures::future::ok(
+                            Response::new()
+                                .with_status(code)
+                                .with_header(ContentType("application/json".parse().unwrap()))
+                                .with_header(ContentLength(err.len() as u64))
+                                .with_body(err)
+                        ))
+                    }
+                }))))
+            }
+            Err(e) => {
+                let body = json!({
                                 "Message": "Could not generate downstream server request",
                                 "Name": format!("{}", StatusCode::InternalServerError)
                                 }).to_string();
 
-                            Box::new(futures::future::err(
-                                Response::new()
-                                    .with_status(StatusCode::InternalServerError)
-                                    .with_header(ContentType("application/json".parse().unwrap()))
-                                    .with_header(ContentLength(body.len() as u64))
-                                    .with_body(body)
-                            ))
-                        }
-
-                    }
-                },
-                Err(e) => {
-                    Box::new(futures::future::err(e))
-                }
+                Box::new(futures::future::ok(
+                    Response::new()
+                        .with_status(StatusCode::InternalServerError)
+                        .with_header(ContentType("application/json".parse().unwrap()))
+                        .with_header(ContentLength(body.len() as u64))
+                        .with_body(body)
+                ))
             }
-        }).map_err(|res| {
-            Box::new(futures::future::ok(res))
-        }))
+
+        }
+//        unimplemented!()
+
+//        Box::new(validate_headers(metrics, self.logger.clone(), client_method, client_uri, client_headers, client_body).then(|res| {
+//            match res {
+//                Err(e @ AuthorizationResult::InvalidHeader(_)) => {
+//                    let body = body_from_auth_error(e);
+//                    return Box::new(futures::future::err(
+//                        Response::new()
+//                            .with_status(StatusCode::BadRequest)
+//                            .with_header(ContentType("application/json".parse().unwrap()))
+//                            .with_header(ContentLength(body.len() as u64))
+//                            .with_body(body)
+//                    ))
+//                }
+//                Err(e @ AuthorizationResult::UnAuthurized) => {
+//                    let body = body_from_auth_error(e);
+//                    return Box::new(futures::future::err(
+//                        Response::new()
+//                            .with_status(StatusCode::Unauthorized)
+//                            .with_header(ContentType("application/json".parse().unwrap()))
+//                            .with_header(ContentLength(body.len() as u64))
+//                            .with_body(body)
+//                    ))
+//                }
+//                Err(e @ AuthorizationResult::SkewError) => {
+//                    let body = body_from_auth_error(e);
+//                    return Box::new(futures::future::err(
+//                        Response::new()
+//                            .with_status(StatusCode::Unauthorized)
+//                            .with_header(ContentType("application/json".parse().unwrap()))
+//                            .with_header(ContentLength(body.len() as u64))
+//                            .with_body(body)
+//                    ))
+//                }
+//                Err(e @ AuthorizationResult::MissingHeaders(_)) => {
+//                    let body = body_from_auth_error(e);
+//                    return Box::new(futures::future::err(
+//                        Response::new()
+//                            .with_status(StatusCode::BadRequest)
+//                            .with_header(ContentType("application/json".parse().unwrap()))
+//                            .with_header(ContentLength(body.len() as u64))
+//                            .with_body(body)
+//                    ))
+//                }
+//                Ok(body) => Box::new(futures::future::ok(body))
+//            }
+//        }).then(|res| {
+//            match res {
+//                Ok(body) => {
+//                    let request = self.gen_request(client_method, client_uri, client_version, client_headers, body);
+//
+//                    match request {
+//                        Ok(request) => {
+//                            Box::new(futures::future::ok(Box::new(self.client.request(request).then(|res| match res {
+//                                Ok(res) => {
+//                                    futures::future::ok(
+//                                        Response::new()
+//                                            .with_status(res.status())
+//                                            .with_headers(res.headers().clone())
+//                                            .with_body(res.body())
+//                                    )
+//                                }
+//                                Err(ref e) => {
+//                                    let (code, err) = client_err(e);
+//                                    futures::future::ok(
+//                                        Response::new()
+//                                            .with_status(code)
+//                                            .with_header(ContentType("application/json".parse().unwrap()))
+//                                            .with_header(ContentLength(err.len() as u64))
+//                                            .with_body(err)
+//                                    )
+//                                }
+//                            }))))
+//                        }
+//                        Err(e) => {
+//                            let body = json!({
+//                                "Message": "Could not generate downstream server request",
+//                                "Name": format!("{}", StatusCode::InternalServerError)
+//                                }).to_string();
+//
+//                            Box::new(futures::future::err(
+//                                Response::new()
+//                                    .with_status(StatusCode::InternalServerError)
+//                                    .with_header(ContentType("application/json".parse().unwrap()))
+//                                    .with_header(ContentLength(body.len() as u64))
+//                                    .with_body(body)
+//                            ))
+//                        }
+//
+//                    }
+//                },
+//                Err(e) => {
+//                    Box::new(futures::future::err(e))
+//                }
+//            }
+//        }).map_err(|res| {
+//            Box::new(futures::future::ok(res))
+//        }))
     }
 }
 

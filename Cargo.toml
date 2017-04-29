@@ -6,6 +6,7 @@ authors = ["Colin O'Brien <cobrien@rapid7.com>"]
 [dependencies]
 base64 = "0.4.*"
 clap = "2.23.*"
+dogstatsd = "*"
 error-chain = "0.10.*"
 futures = "0.1.*"
 ring = "0.7.*"
@@ -20,8 +21,6 @@ time = "0.1.*"
 uuid = { version = "0.4.*", features = ["v4"] }
 xorshift = "0.1.*"
 
-[dependencies.dogstatsd]
-git = "https://github.com/insanitybit/dogstatsd-rs"
 
 [dependencies.hyper]
 git = "https://github.com/hyperium/hyper"

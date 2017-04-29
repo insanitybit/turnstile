@@ -13,7 +13,7 @@ pub struct DroppingMetrics {
 impl DroppingMetrics {
     pub fn with_chance(chance: u32) -> DroppingMetrics {
         DroppingMetrics {
-            client: Client::new(Options::default()),
+            client: Client::new(Options::default()).expect("Failed to create dogstatsd client."),
             prng: Xoroshiro128::from_seed(&[481345754190446, 22956618888, 952505546299]),
             chance: chance
         }
@@ -74,84 +74,5 @@ impl DroppingMetrics {
         } else {
             Ok(())
         }
-    }
-}
-
-#[cfg(all(feature = "unstable", test))]
-mod bench {
-    extern crate test;
-
-    use self::test::Bencher;
-    use super::*;
-
-    #[bench]
-    fn bench_incr(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = &["name1:value1"];
-        b.iter(|| {
-            metrics.incr("bench.incr", tags).unwrap();
-        })
-    }
-
-    #[bench]
-    fn bench_decr(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = &["name1:value1"];
-        b.iter(|| {
-            metrics.decr("bench.decr", tags).unwrap();
-        })
-    }
-
-    #[bench]
-    fn bench_timing(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = &["name1:value1"];
-        let mut i = 0;
-        b.iter(|| {
-            metrics.timing("bench.timing", i, tags).unwrap();
-            i += 1;
-        })
-    }
-
-    #[bench]
-    fn bench_gauge(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = vec!["name1:value1"];
-        let mut i = 0;
-        b.iter(|| {
-            metrics.gauge("bench.timing", &i.to_string(), &tags).unwrap();
-            i += 1;
-        })
-    }
-
-    #[bench]
-    fn bench_histogram(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = vec!["name1:value1"];
-        let mut i = 0;
-        b.iter(|| {
-            metrics.histogram("bench.timing", &i.to_string(), &tags).unwrap();
-            i += 1;
-        })
-    }
-
-    #[bench]
-    fn bench_set(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = vec!["name1:value1"];
-        let mut i = 0;
-        b.iter(|| {
-            metrics.set("bench.timing", &i.to_string(), &tags).unwrap();
-            i += 1;
-        })
-    }
-
-    #[bench]
-    fn bench_event(b: &mut Bencher) {
-        let mut metrics = DroppingMetrics::with_chance(20);
-        let tags = vec!["name1:value1"];
-        b.iter(|| {
-            metrics.event("Test Event Title", "Test Event Message", &tags).unwrap();
-        })
     }
 }
