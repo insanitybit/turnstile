@@ -40,12 +40,13 @@ use slog;
 static LOCAL_SERVER: &'static str = "localhost:9301";
 static MAX_BODY_SIZE: usize = 10 * 1000000;
 
+#[derive(Debug)]
 pub enum AuthorizationResult<'a> {
     MissingHeaders(Vec<&'static str>),
     InvalidHeader(Cow<'a, str>),
     UnsupportedAuthorizationScheme,
     UnsupportedDigest,
-    UnAuthurized,
+    UnAuthorized,
     SkewError,
     BodyReadFailure(hyper::Error)
 }
@@ -56,8 +57,6 @@ pub struct Turnstile {
     config: Config,
     logger: slog::Logger
 }
-
-//fn check_for_skew()
 
 fn check_for_all_headers(headers: &Headers) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -89,7 +88,7 @@ fn bytes_to_algorithm(algorithm: &[u8]) -> std::result::Result<&'static ring::di
     }
 }
 
-fn validate_body(algorithm: &[u8], digest: Vec<u8>, body: Body) -> std::result::Result<Vec<u8>, AuthorizationResult<'static>> {
+fn validate_body(algorithm: &[u8], digest: Vec<u8>, body: Body, headers: &Headers) -> std::result::Result<Vec<u8>, AuthorizationResult<'static>> {
     let algorithm = match bytes_to_algorithm(algorithm) {
         Ok(a) => a,
         Err(e) => return Err(e)
@@ -97,24 +96,30 @@ fn validate_body(algorithm: &[u8], digest: Vec<u8>, body: Body) -> std::result::
 
     let mut ctx = digest::Context::new(algorithm);
 
+    println!("here");
     let res_body: Vec<_> = body.wait().collect();
-
-    let mut body = Vec::new();
+    println!("after");
+    let mut body = match headers.get::<hyper::header::ContentLength>() {
+        Some(&ContentLength(length)) if length > 0 => Vec::with_capacity(length as usize),
+        _ => Vec::new()
+    };
 
     for chunk in res_body {
         match chunk {
             Ok(bytes) => {
                 body.extend_from_slice(bytes.as_ref());
                 ctx.update(bytes.as_ref());
-            },
+            }
             Err(e) => return Err(AuthorizationResult::BodyReadFailure(e))
         }
     }
 
     let body_digest = ctx.finish();
+    let body_digest = base64::encode(body_digest.as_ref());
+
     match ring::constant_time::verify_slices_are_equal(&digest[..], body_digest.as_ref()) {
         Ok(_) => Ok(body),
-        Err(_) => Err(AuthorizationResult::UnAuthurized)
+        Err(_) => Err(AuthorizationResult::UnAuthorized)
     }
 }
 
@@ -123,7 +128,8 @@ fn check_skew(skew: i64, date: &time::Tm) -> Result<()> {
 
     let cur_time = time::now(); // TODO: Time should be collected as soon as the request comes in
 
-    if cur_time - dur > *date || cur_time + dur < *date {
+    // If they sent it too long ago or they are sending from the future
+    if cur_time - dur > *date || cur_time < *date {
         bail!("Date is outside of skew range")
     }
     Ok(())
@@ -134,85 +140,94 @@ fn validate_headers(metric_dog: Dog, logger: slog::Logger, method: &Method, uri:
     {
         let missing = check_for_all_headers(headers);
         if !missing.is_empty() {
+            warn!(logger, format!("Missing headers: {:?}", missing));
             return Err(AuthorizationResult::MissingHeaders(missing))
         }
     }
     // We know that the Date header must be present due to the previous check for all headers
     {
         let &Date(HttpDate(ref time)) = headers.get::<hyper::header::Date>().unwrap();
-        if check_skew(10 * 60, time).is_err() {
+        if check_skew(100000 * 60, time).is_err() {
+            warn!(logger, format!("HttpDate {} is outside of skew range", time.rfc822z()));
             return Err(AuthorizationResult::SkewError)
         }
     }
 
     let (algorithm, digest) = match headers.get_raw("digest").map(get_digest).unwrap() {
         Ok((a, d)) => (a, d),
-        Err(_) => return Err(AuthorizationResult::InvalidHeader("Digest".into()))
+        Err(e) => {
+            warn!(logger, format!("Failed to parse digest header: {:?}", e));
+            return Err(AuthorizationResult::InvalidHeader("Digest".into()))
+        }
     };
 
-    let body = validate_body(&algorithm[..], digest, body);
+    let body = validate_body(&algorithm[..], digest, body, &headers);
 
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(logger, format!("Body checksum failure: {:?}", e));
+            return Err(e)
+        }
+    };
 
-        let body = match body {
-            Ok(body) => body,
-            Err(e) => return Err(e)
+    if let Some(&Authorization(Rapid7HmacScheme { hash: ref token })) = headers.get::<Authorization<Rapid7HmacScheme>>() {
+        let (key_id, signature) = match auth_parse(token) {
+            Ok(pair) => pair,
+            Err(_) => {
+                warn!(logger, "Failed to parse Authorization header");
+                return Err(AuthorizationResult::InvalidHeader("Authorization".into()))
+            }
         };
 
-        if let Some(&Authorization(Rapid7HmacScheme { hash: ref token })) = headers.get::<Authorization<Rapid7HmacScheme>>() {
-            let (key_id, signature) = match auth_parse(token) {
-                Ok(pair) => pair,
-                Err(_) => return Err(AuthorizationResult::InvalidHeader("Authorization".into()))
-            };
+        let mut data = Vec::new();
 
-            let mut data = Vec::new();
+        let host_header = headers.get::<hyper::header::Host>().unwrap();
+        let &Date(HttpDate(ref time)) = headers.get::<hyper::header::Date>().unwrap();
+        let digest_header = headers.get_raw("digest").unwrap();
 
-            let host_header = headers.get::<hyper::header::Host>().unwrap();
-            let &Date(HttpDate(ref time)) = headers.get::<hyper::header::Date>().unwrap();
-            let digest_header = headers.get_raw("digest").unwrap();
+        let time = format!("{}", time.to_timespec().sec * 1000);
 
+        let host = host_header.hostname();
+        let port = host_header.port().map(|p| {
+            let mut buf = String::from(":");
+            buf.push_str(&p.to_string());
+            buf
+        }).unwrap_or("".to_owned());
 
-            let time = format!("{}", time.to_timespec().sec * 1000);
+        data.extend_from_slice(method.as_ref().as_bytes());
+        data.extend_from_slice(b" ");
+        data.extend_from_slice(uri.as_ref().as_bytes());
+        data.extend_from_slice(b"\n");
 
-            let host = host_header.hostname();
-            let port = host_header.port().map(|p| {
-                let mut buf = String::from(":");
-                buf.push_str(&p.to_string());
-                buf
-            }).unwrap_or("".to_owned());
+        data.extend_from_slice(host.as_bytes());
+        data.extend_from_slice(port.as_bytes());
+        data.extend_from_slice(b"\n");
 
+        data.extend_from_slice(time.as_bytes());
+        data.extend_from_slice(b"\n");
 
-            data.extend_from_slice(method.as_ref().as_bytes());
-            data.extend_from_slice(b" ");
-            data.extend_from_slice(uri.as_ref().as_bytes());
-            data.extend_from_slice(b"\n");
+        data.extend_from_slice(&key_id[..]);
+        data.extend_from_slice(b"\n");
 
-            data.extend_from_slice(host.as_bytes());
-            data.extend_from_slice(port.as_bytes());
-            data.extend_from_slice(b"\n");
+        data.extend_from_slice(digest_header.one().unwrap());
+        data.extend_from_slice(b"\n");
 
+        println!("{}", String::from_utf8(data.clone()).unwrap());
+        println!("{}", data.len());
+        let key = hmac::VerificationKey::new(&digest::SHA256, &b"secret"[..]);
 
-            data.extend_from_slice(time.as_bytes());
-            data.extend_from_slice(b"\n");
-
-            data.extend_from_slice(&key_id[..]);
-            data.extend_from_slice(b"\n");
-
-            data.extend_from_slice(digest_header.one().unwrap());
-            data.extend_from_slice(b"\n");
-
-
-            let key = hmac::VerificationKey::new(&digest::SHA256, &b"secret"[..]);
-
-
-            if hmac::verify(&key, &data, &signature).is_ok() {
-                metric_dog.incr("validated", &[]);
-                Ok(body)
-            } else {
-                Err(AuthorizationResult::UnAuthurized)
-            }
+        if hmac::verify(&key, &data, &signature).is_ok() {
+            metric_dog.incr("validated", &[]);
+            Ok(body)
         } else {
-            Err(AuthorizationResult::UnsupportedAuthorizationScheme)
+            warn!(logger, "HMAC Signature Verification failed");
+            Err(AuthorizationResult::UnAuthorized)
         }
+    } else {
+        warn!(logger, "Unsupported Authorization Scheme");
+        Err(AuthorizationResult::UnsupportedAuthorizationScheme)
+    }
 }
 
 impl Turnstile {
@@ -230,15 +245,19 @@ impl Turnstile {
 
         let mut new_req = hyper::client::Request::new(client_method, uri);
 
-        new_req.set_version(client_version);
-        new_req.set_body(client_body);
-
         *new_req.headers_mut() = client_headers.clone();
+        new_req.headers_mut().set::<ContentLength>(ContentLength(client_body.len() as u64));
+
+        new_req.set_version(client_version);
+
+        new_req.set_body(client_body);
         let correlation_id = get_or_gen_correlation_id(&client_headers);
 
         if let Cow::Owned(id) = correlation_id {
             new_req.headers_mut().set_raw("X-Request-Identifier", id)
         }
+
+
 
         Ok(new_req)
     }
@@ -275,7 +294,7 @@ fn auth_parse(unparsed: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut split = token.splitn(2, |b| *b == b':');
 
     if let (Some(ident), Some(sig)) = (split.next(), split.next()) {
-        let sig = base64::decode(&sig).chain_err(|| "")?;
+        let sig = base64::decode(&sig).chain_err(|| "Failed to decode signature.")?;
 
         Ok((ident.to_vec(), sig.to_vec()))
     } else {
@@ -381,7 +400,7 @@ fn body_from_auth_error<'a>(header_result: AuthorizationResult<'a>) -> String {
     let bad_request = format!("{}", StatusCode::BadRequest);
 
     match header_result {
-        AuthorizationResult::UnAuthurized => json!({
+        AuthorizationResult::UnAuthorized => json!({
             "Message":  "Failed to authorize - hmac validation failed",
             "Name":     bad_request,
         }).to_string(),
@@ -433,6 +452,7 @@ impl Service for Turnstile {
 
         let body = match res {
             Err(e) => {
+                trace!(self.logger, format!("Failed to authenticate with: {:#?}", e));
                 let body = body_from_auth_error(e);
                 return Box::new(futures::future::ok(
                     Response::new()
@@ -444,7 +464,7 @@ impl Service for Turnstile {
             }
             Ok(body) => body
         };
-
+        trace!(self.logger, "Successfully proxied client");
         let request = self.gen_request(client_method, client_uri, client_version, client_headers, body);
 
         match request {
@@ -484,7 +504,6 @@ impl Service for Turnstile {
                         .with_body(body)
                 ))
             }
-
         }
     }
 }
